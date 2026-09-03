@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -14,10 +15,20 @@ import (
 	"github.com/disgoorg/disgo/bot"
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/events"
+	"github.com/disgoorg/disgo/gateway"
+	"github.com/disgoorg/disgo/rest"
+	"github.com/disgoorg/snowflake/v2"
 	"github.com/joho/godotenv"
 )
 
+var (
+	cleanup = flag.Bool("cleanup", false, "Clean up all slash commands and exit")
+	refresh = flag.Bool("refresh", false, "Refresh all slash commands")
+	guild   = flag.String("guild", "", "Specific Guild ID to apply cleanup/refresh to (optional)")
+)
+
 func main() {
+	flag.Parse()
 	_ = godotenv.Load()
 	token := os.Getenv("BOT_TOKEN")
 	if token == "" {
@@ -30,10 +41,10 @@ func main() {
 
 	client, err := disgo.New(token,
 		bot.WithGatewayConfigOpts(
-			discord.WithIntents(
-				discord.IntentGuilds,
-				discord.IntentGuildMessages,
-				discord.IntentMessageContent,
+			gateway.WithIntents(
+				gateway.IntentGuilds,
+				gateway.IntentGuildMessages,
+				gateway.IntentMessageContent,
 			),
 		),
 		bot.WithEventListeners(
@@ -53,7 +64,41 @@ func main() {
 		return
 	}
 
-	registerCommands(client)
+	if *cleanup {
+		if *guild != "" {
+			gID, _ := snowflake.Parse(*guild)
+			_, err = client.Rest.SetGuildCommands(client.ApplicationID, gID, []discord.ApplicationCommandCreate{})
+			if err != nil {
+				fmt.Println("error cleaning up guild commands:", err)
+			} else {
+				fmt.Println("Cleaned up guild commands for", *guild)
+			}
+		} else {
+			_, err = client.Rest.SetGlobalCommands(client.ApplicationID, []discord.ApplicationCommandCreate{})
+			if err != nil {
+				fmt.Println("error cleaning up global commands:", err)
+			} else {
+				fmt.Println("Cleaned up global commands.")
+			}
+		}
+		return
+	}
+
+	if *refresh {
+		if *guild != "" {
+			gID, _ := snowflake.Parse(*guild)
+			_, err = client.Rest.SetGuildCommands(client.ApplicationID, gID, commands)
+			if err != nil {
+				fmt.Println("error refreshing guild commands:", err)
+			} else {
+				fmt.Println("Refreshed guild commands for", *guild)
+			}
+		} else {
+			registerCommands(client)
+			fmt.Println("Refreshed global commands.")
+		}
+	}
+
 	fmt.Println("Bot is running. Press CTRL-C to exit.")
 	s := make(chan os.Signal, 1)
 	signal.Notify(s, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
@@ -88,32 +133,76 @@ func messageHandler(db *sql.DB) func(event *events.MessageCreate) {
 		nextCount := entry.Count + 1
 
 		if providedInt != nextCount {
-			_ = event.Client().Rest().DeleteMessage(event.ChannelID, event.MessageID)
+			_ = event.Client().Rest.DeleteMessage(event.ChannelID, event.MessageID)
 			return
 		}
 
 		if entry.LastCounter == event.Message.Author.ID.String() && !config.AllowDoublePost {
-			_ = event.Client().Rest().DeleteMessage(event.ChannelID, event.MessageID)
-			ch, err := event.Client().Rest().CreateDMChannel(event.Message.Author.ID)
+			_ = event.Client().Rest.DeleteMessage(event.ChannelID, event.MessageID)
+			ch, err := event.Client().Rest.CreateDMChannel(event.Message.Author.ID)
 			if err == nil {
-				_, _ = event.Client().Rest().CreateMessage(ch.ID(), discord.MessageCreate{
+				_, _ = event.Client().Rest.CreateMessage(ch.ID(), discord.MessageCreate{
 					Content: fmt.Sprintf("You have already counted in <#%s>! Wait for someone else to count before you count again.", event.ChannelID.String()),
 				})
 			}
 			return
 		}
 
-		_ = event.Client().Rest().DeleteMessage(event.ChannelID, event.MessageID)
+		_ = event.Client().Rest.DeleteMessage(event.ChannelID, event.MessageID)
 
 		entry.Count = nextCount
 		entry.LastCounter = event.Message.Author.ID.String()
 		_ = setCountEntry(db, entry)
 
-		webhookID, _ := discord.ParseSnowflake(config.WebhookID)
-		_, _ = event.Client().Rest().CreateWebhookMessage(webhookID, config.WebhookToken, discord.WebhookMessageCreate{
+		webhookID, _ := snowflake.Parse(config.WebhookID)
+		
+		avatarURL := ""
+		if url := event.Message.Author.AvatarURL(); url != nil {
+			avatarURL = *url
+		}
+
+		apiMsg, err := event.Client().Rest.CreateWebhookMessage(webhookID, config.WebhookToken, discord.WebhookMessageCreate{
 			Content:   strconv.Itoa(nextCount),
 			Username:  event.Message.Author.Username,
-			AvatarURL: event.Message.Author.AvatarURL(),
-		}, true, 0)
+			AvatarURL: avatarURL,
+		}, rest.CreateWebhookMessageParams{Wait: true})
+
+		var apiMsgID snowflake.ID
+		if err == nil && apiMsg != nil {
+			apiMsgID = apiMsg.ID
+		}
+
+		rules, _ := getGuildRules(db, event.GuildID.String())
+		for _, rule := range rules {
+			match := false
+			if rule.Type == "equals" && nextCount == rule.Value {
+				match = true
+			} else if rule.Type == "multiple_of" && rule.Value != 0 && nextCount%rule.Value == 0 {
+				match = true
+			}
+			if !match {
+				continue
+			}
+
+			ruleContent := strings.ReplaceAll(rule.ActionV1, "{{count}}", strconv.Itoa(nextCount))
+
+			switch rule.Action {
+			case "pin":
+				if apiMsgID != 0 {
+					_ = event.Client().Rest.PinMessage(event.ChannelID, apiMsgID)
+				}
+			case "dm":
+				ch, err := event.Client().Rest.CreateDMChannel(event.Message.Author.ID)
+				if err == nil {
+					_, _ = event.Client().Rest.CreateMessage(ch.ID(), discord.MessageCreate{
+						Content: ruleContent,
+					})
+				}
+			case "msg":
+				_, _ = event.Client().Rest.CreateMessage(event.ChannelID, discord.MessageCreate{
+					Content: ruleContent,
+				})
+			}
+		}
 	}
 }

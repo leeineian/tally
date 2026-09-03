@@ -130,3 +130,23 @@ func getGuildRules(db *sql.DB, guildID string) ([]GuildRule, error) {
 	}
 	return rules, nil
 }
+
+func addGuildRule(db *sql.DB, r GuildRule) error {
+	_, err := db.Exec(`
+		INSERT INTO guild_rules (id, guild, trigger, type, value, action, action_v1)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, r.ID, r.Guild, r.Trigger, r.Type, r.Value, r.Action, r.ActionV1)
+	return err
+}
+
+func deleteGuildRule(db *sql.DB, id, guildID string) error {
+	_, err := db.Exec("DELETE FROM guild_rules WHERE id = ? AND guild = ?", id, guildID)
+	return err
+}
+
+func getGuildRule(db *sql.DB, id, guildID string) (GuildRule, error) {
+	var r GuildRule
+	err := db.QueryRow("SELECT id, guild, trigger, type, value, action, action_v1 FROM guild_rules WHERE id = ? AND guild = ?", id, guildID).
+		Scan(&r.ID, &r.Guild, &r.Trigger, &r.Type, &r.Value, &r.Action, &r.ActionV1)
+	return r, err
+}
