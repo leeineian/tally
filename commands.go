@@ -7,6 +7,7 @@ import (
 	"github.com/disgoorg/disgo/bot"
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/events"
+	"github.com/disgoorg/snowflake/v2"
 )
 
 var commands = []discord.ApplicationCommandCreate{
@@ -90,13 +91,22 @@ var commands = []discord.ApplicationCommandCreate{
 		Description: "Configure tally settings",
 		Options: []discord.ApplicationCommandOption{
 			discord.ApplicationCommandOptionSubCommand{
-				Name:        "count",
+				Name:        "current-count",
 				Description: "Set the current count",
 				Options: []discord.ApplicationCommandOption{
 					discord.ApplicationCommandOptionInt{
-						Name:        "count",
+						Name:        "number",
 						Description: "The count to set",
 						Required:    true,
+					},
+					discord.ApplicationCommandOptionString{
+						Name:        "purge",
+						Description: "Purge messages down to this count?",
+						Required:    false,
+						Choices: []discord.ApplicationCommandOptionChoiceString{
+							{Name: "Yes", Value: "yes"},
+							{Name: "No", Value: "no"},
+						},
 					},
 				},
 			},
@@ -129,9 +139,12 @@ var commands = []discord.ApplicationCommandCreate{
 					},
 				},
 			},
+			discord.ApplicationCommandOptionSubCommand{
+				Name:        "view",
+				Description: "View current settings",
+			},
 		},
 	},
-
 }
 
 func registerCommands(client *bot.Client) {
@@ -228,46 +241,103 @@ func commandHandler(db *sql.DB) func(event *events.ApplicationCommandInteraction
 					Flags:   discord.MessageFlagEphemeral,
 				})
 			}
-		case "set-channel":
+		case "settings":
 			if event.GuildID() == nil {
 				return
 			}
-			channelID := data.Snowflake("channel")
-			config, _ := getGuildConfig(db, event.GuildID().String())
-			
-			webhook, err := event.Client().Rest.CreateWebhook(channelID, discord.WebhookCreate{
-				Name: "Tally Webhook",
-			})
-			if err != nil {
+			sub := *data.SubCommandName
+			switch sub {
+			case "current-count":
+				_ = event.DeferCreateMessage(true)
+				
+				num := data.Int("number")
+
+				purgeOpt, ok := data.OptString("purge")
+				purge := ok && purgeOpt == "yes"
+
+				if purge {
+					config, _ := getGuildConfig(db, event.GuildID().String())
+					webhookID, _ := snowflake.Parse(config.WebhookID)
+
+					msgs, _ := getMessagesToPurge(db, event.GuildID().String(), num)
+					for _, msgIDStr := range msgs {
+						if msgIDStr == "" {
+							continue
+						}
+						msgID, _ := snowflake.Parse(msgIDStr)
+						_ = event.Client().Rest.DeleteWebhookMessage(webhookID, config.WebhookToken, msgID, 0)
+					}
+					_ = deletePurgedMessages(db, event.GuildID().String(), num)
+				}
+
+				entry, _ := getCountEntry(db, event.GuildID().String())
+				entry.Count = num
+				entry.LastCounter = ""
+				setCountEntry(db, entry)
+
+				msg := fmt.Sprintf("Count set to %d.", num)
+				if purge {
+					msg += " Purged newer messages."
+				}
+				
+				_, _ = event.Client().Rest.UpdateInteractionResponse(event.ApplicationID(), event.Token(), discord.MessageUpdate{
+					Content: &msg,
+				})
+			case "channel":
+				channelID := data.Snowflake("channel")
+				config, _ := getGuildConfig(db, event.GuildID().String())
+
+				webhook, err := createCountingWebhook(event.Client(), channelID)
+				if err != nil {
+					event.CreateMessage(discord.MessageCreate{
+						Content: "Failed to create webhook in channel.",
+						Flags:   discord.MessageFlagEphemeral,
+					})
+					return
+				}
+
+				config.Active = true
+				config.Channel = channelID.String()
+				config.WebhookID = webhook.ID().String()
+				config.WebhookToken = webhook.(*discord.IncomingWebhook).Token
+				setGuildConfig(db, config)
 				event.CreateMessage(discord.MessageCreate{
-					Content: "Failed to create webhook in channel.",
+					Content: fmt.Sprintf("Counting channel set to <#%s>", channelID.String()),
 					Flags:   discord.MessageFlagEphemeral,
 				})
-				return
-			}
+			case "take-turns":
+				state := data.String("state")
+				config, _ := getGuildConfig(db, event.GuildID().String())
+				if state == "on" {
+					config.AllowDoublePost = false
+				} else {
+					config.AllowDoublePost = true
+				}
+				setGuildConfig(db, config)
+				event.CreateMessage(discord.MessageCreate{
+					Content: fmt.Sprintf("Take turns setting is now %s.", state),
+					Flags:   discord.MessageFlagEphemeral,
+				})
+			case "view":
+				config, _ := getGuildConfig(db, event.GuildID().String())
 
-			config.Active = true
-			config.Channel = channelID.String()
-			config.WebhookID = webhook.ID().String()
-			config.WebhookToken = webhook.Token
-			setGuildConfig(db, config)
-			event.CreateMessage(discord.MessageCreate{
-				Content: fmt.Sprintf("Counting channel set to <#%s>", channelID.String()),
-				Flags:   discord.MessageFlagEphemeral,
-			})
-		case "set-count":
-			if event.GuildID() == nil {
-				return
+				channelStr := "None"
+				if config.Channel != "" {
+					channelStr = fmt.Sprintf("<#%s>", config.Channel)
+				}
+
+				takeTurns := "On"
+				if config.AllowDoublePost {
+					takeTurns = "Off"
+				}
+
+				out := fmt.Sprintf("**Tally Settings:**\n\n**Counting Channel:** %s\n**Take Turns:** %s", channelStr, takeTurns)
+
+				event.CreateMessage(discord.MessageCreate{
+					Content: out,
+					Flags:   discord.MessageFlagEphemeral,
+				})
 			}
-			count := data.Int("count")
-			entry, _ := getCountEntry(db, event.GuildID().String())
-			entry.Count = count
-			entry.LastCounter = ""
-			setCountEntry(db, entry)
-			event.CreateMessage(discord.MessageCreate{
-				Content: fmt.Sprintf("Count set to %d", count),
-				Flags:   discord.MessageFlagEphemeral,
-			})
 		}
 	}
 }

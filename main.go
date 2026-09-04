@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -26,6 +27,39 @@ var (
 	refresh = flag.Bool("refresh", false, "Refresh all slash commands")
 	guild   = flag.String("guild", "", "Specific Guild ID to apply cleanup/refresh to (optional)")
 )
+
+func createCountingWebhook(client *bot.Client, channelID snowflake.ID) (discord.Webhook, error) {
+	webhookName := os.Getenv("WEBHOOK_NAME")
+	if webhookName == "" {
+		webhookName = "webhook"
+	}
+
+	var avatarIcon *discord.Icon
+	if selfUser, err := client.Rest.GetUser(client.ApplicationID); err == nil && selfUser.AvatarURL() != nil {
+		resp, err := http.Get(*selfUser.AvatarURL())
+		if err == nil {
+			defer resp.Body.Close()
+			
+			iconType := discord.IconTypePNG
+			contentType := resp.Header.Get("Content-Type")
+			if strings.Contains(contentType, "jpeg") || strings.Contains(contentType, "jpg") {
+				iconType = discord.IconTypeJPEG
+			} else if strings.Contains(contentType, "gif") {
+				iconType = discord.IconTypeGIF
+			}
+
+			icon, err := discord.NewIcon(iconType, resp.Body)
+			if err == nil {
+				avatarIcon = icon
+			}
+		}
+	}
+
+	return client.Rest.CreateWebhook(channelID, discord.WebhookCreate{
+		Name:   webhookName,
+		Avatar: avatarIcon,
+	})
+}
 
 func main() {
 	flag.Parse()
@@ -99,7 +133,11 @@ func main() {
 		}
 	}
 
-	fmt.Println("Bot is running. Press CTRL-C to exit.")
+	if selfUser, err := client.Rest.GetUser(client.ApplicationID); err == nil {
+		fmt.Printf("%s (%s) is up. Press CTRL-C to exit.\n", selfUser.Username, client.ApplicationID.String())
+	} else {
+		fmt.Printf("Bot (%s) is up. Press CTRL-C to exit.\n", client.ApplicationID.String())
+	}
 	s := make(chan os.Signal, 1)
 	signal.Notify(s, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-s
@@ -154,6 +192,8 @@ func messageHandler(db *sql.DB) func(event *events.MessageCreate) {
 		entry.LastCounter = event.Message.Author.ID.String()
 		_ = setCountEntry(db, entry)
 
+
+
 		webhookID, _ := snowflake.Parse(config.WebhookID)
 		
 		avatarURL := ""
@@ -166,10 +206,27 @@ func messageHandler(db *sql.DB) func(event *events.MessageCreate) {
 			Username:  event.Message.Author.Username,
 			AvatarURL: avatarURL,
 		}, rest.CreateWebhookMessageParams{Wait: true})
+		
+		if err != nil {
+			newWebhook, hwErr := createCountingWebhook(event.Client(), event.ChannelID)
+			if hwErr == nil {
+				config.WebhookID = newWebhook.ID().String()
+				config.WebhookToken = newWebhook.(*discord.IncomingWebhook).Token
+				setGuildConfig(db, config)
+				
+				webhookID = newWebhook.ID()
+				apiMsg, err = event.Client().Rest.CreateWebhookMessage(webhookID, config.WebhookToken, discord.WebhookMessageCreate{
+					Content:   strconv.Itoa(nextCount),
+					Username:  event.Message.Author.Username,
+					AvatarURL: avatarURL,
+				}, rest.CreateWebhookMessageParams{Wait: true})
+			}
+		}
 
 		var apiMsgID snowflake.ID
 		if err == nil && apiMsg != nil {
 			apiMsgID = apiMsg.ID
+			_ = saveCountMessage(db, event.GuildID.String(), nextCount, apiMsgID.String())
 		}
 
 		rules, _ := getGuildRules(db, event.GuildID.String())

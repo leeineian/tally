@@ -38,6 +38,10 @@ func initDB() *sql.DB {
 		panic(err)
 	}
 
+	_, _ = db.Exec("PRAGMA journal_mode=WAL;")
+	_, _ = db.Exec("PRAGMA busy_timeout=5000;")
+	_, _ = db.Exec("PRAGMA synchronous=NORMAL;")
+
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS guild_configs (
 			id TEXT PRIMARY KEY,
@@ -45,7 +49,10 @@ func initDB() *sql.DB {
 			channel TEXT,
 			webhook_id TEXT,
 			webhook_token TEXT,
-			allow_double_post BOOLEAN
+			allow_double_post BOOLEAN,
+			live_status BOOLEAN,
+			live_count_id TEXT,
+			live_count_content TEXT
 		);
 		CREATE TABLE IF NOT EXISTS count_entries (
 			guild TEXT PRIMARY KEY,
@@ -61,10 +68,21 @@ func initDB() *sql.DB {
 			action TEXT,
 			action_v1 TEXT
 		);
+		CREATE TABLE IF NOT EXISTS count_messages (
+			guild TEXT,
+			count INTEGER,
+			message_id TEXT,
+			PRIMARY KEY (guild, count)
+		);
 	`)
 	if err != nil {
 		panic(err)
 	}
+	
+	_, _ = db.Exec("ALTER TABLE guild_configs ADD COLUMN live_status BOOLEAN DEFAULT 0;")
+	_, _ = db.Exec("ALTER TABLE guild_configs ADD COLUMN live_count_id TEXT DEFAULT '';")
+	_, _ = db.Exec("ALTER TABLE guild_configs ADD COLUMN live_count_content TEXT DEFAULT '';")
+
 	return db
 }
 
@@ -128,6 +146,9 @@ func getGuildRules(db *sql.DB, guildID string) ([]GuildRule, error) {
 		}
 		rules = append(rules, r)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return rules, nil
 }
 
@@ -149,4 +170,38 @@ func getGuildRule(db *sql.DB, id, guildID string) (GuildRule, error) {
 	err := db.QueryRow("SELECT id, guild, trigger, type, value, action, action_v1 FROM guild_rules WHERE id = ? AND guild = ?", id, guildID).
 		Scan(&r.ID, &r.Guild, &r.Trigger, &r.Type, &r.Value, &r.Action, &r.ActionV1)
 	return r, err
+}
+
+func saveCountMessage(db *sql.DB, guildID string, count int, messageID string) error {
+	_, err := db.Exec(`
+		INSERT INTO count_messages (guild, count, message_id)
+		VALUES (?, ?, ?)
+		ON CONFLICT(guild, count) DO UPDATE SET message_id = excluded.message_id
+	`, guildID, count, messageID)
+	return err
+}
+
+func getMessagesToPurge(db *sql.DB, guildID string, targetCount int) ([]string, error) {
+	rows, err := db.Query("SELECT message_id FROM count_messages WHERE guild = ? AND count > ?", guildID, targetCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			msgs = append(msgs, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return msgs, nil
+}
+
+func deletePurgedMessages(db *sql.DB, guildID string, targetCount int) error {
+	_, err := db.Exec("DELETE FROM count_messages WHERE guild = ? AND count > ?", guildID, targetCount)
+	return err
 }
