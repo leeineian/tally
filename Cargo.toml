@@ -1,0 +1,16 @@
+[package]
+name = "rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+dotenvy = "0.15.7"
+futures = "0.3.34"
+rusqlite = "0.40.2"
+rustls = { version = "0.23.45", features = ["ring"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal"] }
+twilight-gateway = "0.17.1"
+twilight-http = "0.17.1"
+twilight-model = "0.17.1"
+twilight-util = { version = "0.17.0", features = ["builder"] }
